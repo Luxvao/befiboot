@@ -1,2 +1,1 @@
-# befiboot
-A simple UEFI bootloader
+# Bor's (U)EFI BOOTloader

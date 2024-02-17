@@ -7,9 +7,10 @@ use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use log::info;
 use uefi::{
     fs::{FileSystem, Path, PathBuf},
-    prelude::*,
+    prelude::*, table::Runtime,
 };
 use uefi_services::init;
+use xmas_elf::ElfFile;
 
 #[entry]
 unsafe fn boot_main(efi_handle: Handle, mut table: SystemTable<Boot>) -> Status {
@@ -18,16 +19,35 @@ unsafe fn boot_main(efi_handle: Handle, mut table: SystemTable<Boot>) -> Status 
         Err(_) => exit_efi(efi_handle, &table),
     }
 
-    let mut mem_table_buffer: Vec<u8> = Vec::new();
-    
-    table.boot_services().memory_map(&mut mem_table_buffer).unwrap();
+    let mut vars = parse_config(&table, &efi_handle).expect("Failed to parse config!");
 
+    
+    let esp = vars.get(String::from("esp")).unwrap().clone();
+
+    let kernel = vars.get(String::from("kernel")).unwrap().clone();
+
+    info!("ESP: {}", esp);
+
+    info!("Kernel: {}", kernel);
+
+    let mut kernel_path = PathBuf::new();
+
+    load_kernel(&table, kernel_path, &efi_handle).expect("Unable to load the kernel!");
+
+    Status::SUCCESS
+}
+
+fn parse_config(table: &SystemTable<Boot>, efi_handle: &Handle) -> Result<HashMap<String, String>, ()> {
     info!("Getting disk...");
 
-    let simple_disk = match table.boot_services().get_image_file_system(efi_handle) {
-        Ok(disk) => disk,
-        Err(_) => exit_efi(efi_handle, &table),
-    };
+    let simple_disk;
+
+    unsafe {
+        simple_disk = match table.boot_services().get_image_file_system(*efi_handle) {
+            Ok(disk) => disk,
+            Err(_) => exit_efi(*efi_handle, table),
+        };
+    }
 
     let mut disk = FileSystem::new(simple_disk);
 
@@ -37,10 +57,14 @@ unsafe fn boot_main(efi_handle: Handle, mut table: SystemTable<Boot>) -> Status 
 
     let config_path = Path::new(cstr16!("boot\\befiboot\\config.conf"));
 
-    let config = match disk.read_to_string(config_path) {
-        Ok(config) => config,
-        Err(_) => exit_efi(efi_handle, &table),
-    };
+    let config;
+
+    unsafe {
+        config = match disk.read_to_string(config_path) {
+            Ok(config) => config,
+            Err(_) => exit_efi(*efi_handle, &table),
+        };
+    }
 
     info!("DONE.");
 
@@ -56,25 +80,35 @@ unsafe fn boot_main(efi_handle: Handle, mut table: SystemTable<Boot>) -> Status 
     while let Some(item) = tokens.next() {
         let key = item;
 
-        let eq = match tokens.next() {
-            Some(eq) => eq,
-            None => {
-                log::error!("Syntax error! Expected '=' !");
-                exit_efi(efi_handle, &table);
-            }
-        };
+        let eq; 
 
-        let val = match tokens.next() {
-            Some(val) => val,
-            None => {
-                log::error!("Syntax error! Expected value!");
-                exit_efi(efi_handle, &table);
-            }
-        };
+        unsafe {
+            eq = match tokens.next() {
+                Some(eq) => eq,
+                None => {
+                    log::error!("Syntax error! Expected '=' !");
+                    exit_efi(*efi_handle, &table);
+                }
+            };
+        }
+
+        let val;
+
+        unsafe {
+            val = match tokens.next() {
+                Some(val) => val,
+                None => {
+                    log::error!("Syntax error! Expected value!");
+                    exit_efi(*efi_handle, &table);
+                }
+            };
+        }
 
         if eq.trim() != "=" {
             log::error!("Syntax error! Expected '=' !");
-            exit_efi(efi_handle, &table);
+            unsafe {
+                exit_efi(*efi_handle, &table);
+            }
         }
 
         vars.insert(key.to_owned(), val.to_owned());
@@ -82,21 +116,27 @@ unsafe fn boot_main(efi_handle: Handle, mut table: SystemTable<Boot>) -> Status 
 
     info!("DONE.");
 
-    let esp = vars.get(String::from("esp")).unwrap().clone();
+    Ok(vars)
+}
 
-    let kernel = vars.get(String::from("kernel")).unwrap().clone();
+fn load_kernel(table: &SystemTable<Boot>, kernel_path: PathBuf, handle: &Handle) -> Result<*const fn(&SystemTable<Runtime>), ()> {
 
-    info!("ESP: {}", esp);
+    let mut kernel_entry: *const fn(&SystemTable<Runtime>) = core::ptr::null();
 
-    info!("Kernel: {}", kernel);
+    let simple_fs = match table.boot_services().get_image_file_system(*handle) {
+        Ok(fs) => fs,
+        Err(_) => unsafe {
+            exit_efi(*handle, table);
+        }
+    };
 
-    let mut kernel_path = PathBuf::new();
+    let mut fs = FileSystem::new(simple_fs);
 
-    
-  
-    table.boot_services().stall(10000000000000);
+    let kernel_raw = fs.read(kernel_path).expect("Failed to read kernel from disk");
 
-    Status::SUCCESS
+    let kernel = ElfFile::new(&kernel_raw).expect("Unable to parse kernel");
+
+    Ok(kernel_entry)
 }
 
 unsafe fn exit_efi(handle: Handle, table: &SystemTable<Boot>) -> ! {
